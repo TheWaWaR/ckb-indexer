@@ -1,3 +1,4 @@
+use crate::telegram::TelegramClient;
 use crate::{
     pool::Pool,
     store::{Batch, Error as StoreError, IteratorDirection, Store},
@@ -5,11 +6,14 @@ use crate::{
 
 use ckb_types::{
     core::{BlockNumber, BlockView},
+    h256,
     packed::{Byte32, Bytes, CellOutput, OutPoint, Script},
     prelude::*,
+    H256,
 };
 use thiserror::Error;
 
+use chrono::{Local, TimeZone};
 use std::convert::TryInto;
 use std::{
     collections::HashMap,
@@ -23,6 +27,15 @@ pub enum CellType {
     Input,
     Output,
 }
+pub const DAO_TYPE_HASH: H256 =
+    h256!("0x82d76d1b75fe2fd9a27dfbaa65a039221a380d76c926f378d3f81cf3e7e13f2e");
+pub const ONE_CKB: u64 = 100_000_000;
+pub const CKB_1MB: u64 = 1_000_000 * ONE_CKB;
+pub const CKB_10MB: u64 = 10 * CKB_1MB;
+pub const CKB_100MB: u64 = 100 * CKB_1MB;
+pub const CKB_200MB: u64 = 200 * CKB_1MB;
+pub const CKB_500MB: u64 = 500 * CKB_1MB;
+pub const CKB_1GB: u64 = 10 * CKB_100MB;
 
 /// +--------------+--------------------+--------------------------+
 /// | KeyPrefix::  | Key::              | Value::                  |
@@ -214,7 +227,6 @@ pub struct DetailedLiveCell {
     pub cell_data: Bytes,
 }
 
-#[derive(Clone)]
 pub struct Indexer<S> {
     store: S,
     // number of blocks to keep for rollback and forking, for example:
@@ -224,6 +236,7 @@ pub struct Indexer<S> {
     // an optional overlay to index the pending txs in the ckb tx pool
     // currently only supports removals of dead cells from the pending txs
     pool: Option<Arc<RwLock<Pool>>>,
+    telegram_client: Option<TelegramClient>,
 }
 
 impl<S> Indexer<S> {
@@ -232,17 +245,39 @@ impl<S> Indexer<S> {
         keep_num: u64,
         prune_interval: u64,
         pool: Option<Arc<RwLock<Pool>>>,
+        telegram_client: Option<TelegramClient>,
     ) -> Self {
         Self {
             store,
             keep_num,
             prune_interval,
             pool,
+            telegram_client,
         }
     }
 
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    fn flush_telegram(&self) {
+        if let Some(telegram_client) = self.telegram_client.as_ref() {
+            match telegram_client.flush() {
+                Ok(info) => {
+                    log::info!("flush telegram success, info: {}", info);
+                }
+                Err(err) => {
+                    log::error!("flush telegram error: {}", err);
+                }
+            }
+        }
+    }
+}
+
+impl<S> Drop for Indexer<S> {
+    fn drop(&mut self) {
+        log::info!("drop Indexer");
+        self.flush_telegram();
     }
 }
 
@@ -250,6 +285,55 @@ impl<S> Indexer<S>
 where
     S: Store,
 {
+    fn analysis(
+        &self,
+        type_script: &Script,
+        output: &CellOutput,
+        output_data: &Bytes,
+        block_number: u64,
+        block: &BlockView,
+        is_inputs: bool,
+    ) {
+        if let Some(telegram_client) = self.telegram_client.as_ref() {
+            if type_script.code_hash().as_slice() == DAO_TYPE_HASH.as_bytes() {
+                let capacity: u64 = output.capacity().unpack();
+                let timestamp = block.timestamp();
+                // 1MB CKB
+                if capacity >= CKB_1MB {
+                    let data = output_data.raw_data();
+                    let action = if data.as_ref() == [0u8; 8] {
+                        "deposit"
+                    } else if data.as_ref().len() == 8 {
+                        if is_inputs {
+                            "withdraw"
+                        } else {
+                            "prepare"
+                        }
+                    } else {
+                        unreachable!();
+                    };
+                    let dt = Local.timestamp_millis(timestamp as i64);
+                    let message = format!(
+                        "[#{}@{}] {} {}",
+                        block_number,
+                        dt,
+                        action,
+                        bytesize::ByteSize(capacity / ONE_CKB),
+                        // output.lock()
+                    );
+                    match telegram_client.send_notify(message.clone(), true) {
+                        Ok(info) => {
+                            log::info!("notify telegram: {}, info: {}", message, info);
+                        }
+                        Err(err) => {
+                            log::error!("notify telegram error: {}", err);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn append(&self, block: &BlockView) -> Result<(), Error> {
         let mut batch = self.store.batch()?;
         // insert block transactions
@@ -303,7 +387,7 @@ where
                         })
                         .expect("stored live cell or consume output in same block");
 
-                    let (generated_by_block_number, generated_by_tx_index, output, _output_data) =
+                    let (generated_by_block_number, generated_by_tx_index, output, output_data) =
                         Value::parse_cell_value(&stored_live_cell);
 
                     batch.delete(
@@ -326,6 +410,7 @@ where
                         Value::TxHash(&tx_hash),
                     )?;
                     if let Some(script) = output.type_().to_opt() {
+                        self.analysis(&script, &output, &output_data, block_number, block, true);
                         batch.delete(
                             Key::CellTypeScript(
                                 &script,
@@ -378,6 +463,7 @@ where
                     Value::TxHash(&tx_hash),
                 )?;
                 if let Some(script) = output.type_().to_opt() {
+                    self.analysis(&script, &output, &output_data, block_number, block, false);
                     batch.put_kv(
                         Key::CellTypeScript(&script, block_number, tx_index, output_index),
                         Value::TxHash(&tx_hash),
@@ -419,6 +505,9 @@ where
 
         if block_number % self.prune_interval == 0 {
             self.prune()?;
+        }
+        if block_number % 1000 == 0 {
+            self.flush_telegram();
         }
         Ok(())
     }

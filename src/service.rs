@@ -1,6 +1,7 @@
 use crate::indexer::{self, extract_raw_data, Indexer, Key, KeyPrefix, Value};
 use crate::pool::Pool;
 use crate::store::{IteratorDirection, RocksdbStore, Store};
+use crate::telegram::TelegramClient;
 
 use ckb_jsonrpc_types::{
     BlockNumber, Capacity, CellOutput, HeaderView, JsonBytes, LocalNode, OutPoint, Script, Uint32,
@@ -32,6 +33,8 @@ pub struct Service {
     poll_interval: Duration,
     listen_address: String,
     version: String,
+    telegram_token: Option<String>,
+    telegram_chat_id: Option<String>,
 }
 
 impl Service {
@@ -41,6 +44,8 @@ impl Service {
         listen_address: &str,
         poll_interval: Duration,
         version: String,
+        telegram_token: Option<String>,
+        telegram_chat_id: Option<String>,
     ) -> Self {
         let store = RocksdbStore::new(store_path);
         Self {
@@ -49,6 +54,8 @@ impl Service {
             listen_address: listen_address.to_string(),
             poll_interval,
             version,
+            telegram_token,
+            telegram_chat_id,
         }
     }
 
@@ -82,7 +89,24 @@ impl Service {
         let incompatible_version = Version::from("0.99.99").expect("checked version str");
         // assume that long fork will not happen >= 100 blocks.
         let keep_num = 100;
-        let indexer = Indexer::new(self.store.clone(), keep_num, 1000, self.pool.clone());
+        let telegram_client = if let Some(token) = self.telegram_token.clone() {
+            if let Some(chat_id) = self.telegram_chat_id.clone() {
+                info!("Create telegram client with chat id: {}", chat_id);
+                Some(TelegramClient::new(token, chat_id))
+            } else {
+                error!("telegram token is given, chat id is missing");
+                None
+            }
+        } else {
+            None
+        };
+        let indexer = Indexer::new(
+            self.store.clone(),
+            keep_num,
+            1000,
+            self.pool.clone(),
+            telegram_client,
+        );
 
         loop {
             match rpc_client.local_node_info().await {
