@@ -400,8 +400,25 @@ where
                 }
             }
         }
+        let total = total_deposit + total_prepare + total_withdraw;
+
+        // [Notify Level]:
+        // * ALERT   : more than 1GB changed
+        // * WARNING : more than 500MB changed
+        // * NOTE    : more than 200MB changed
+        // * other   : less than 200MB changed
+        let remark = if total >= CKB_1GB {
+            "[ALERT] "
+        } else if total >= CKB_500MB {
+            "[WARNING] "
+        } else if total >= CKB_200MB {
+            "[NOTE] "
+        } else {
+            ""
+        };
         let message = format!(
-            "[epoch#{}] deposit: {}, prepare: {}, withdraw: {}",
+            "{}[epoch#{}] deposit: {}, prepare: {}, withdraw: {}",
+            remark,
             last_epoch,
             bytesize::ByteSize::b(total_deposit / ONE_CKB),
             bytesize::ByteSize::b(total_prepare / ONE_CKB),
