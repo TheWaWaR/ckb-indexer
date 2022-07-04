@@ -31,6 +31,8 @@ pub const DAO_TYPE_HASH: H256 =
 pub const ONE_CKB: u64 = 100_000_000;
 pub const CKB_1MB: u64 = 1_000_000 * ONE_CKB;
 pub const CKB_10MB: u64 = 10 * CKB_1MB;
+pub const CKB_20MB: u64 = 20 * CKB_1MB;
+pub const CKB_50MB: u64 = 50 * CKB_1MB;
 pub const CKB_100MB: u64 = 100 * CKB_1MB;
 pub const CKB_200MB: u64 = 200 * CKB_1MB;
 pub const CKB_500MB: u64 = 500 * CKB_1MB;
@@ -366,15 +368,10 @@ where
         Ok(())
     }
 
-    fn dao_report(&self, epoch_number: u64) -> Result<(), Error> {
-        if epoch_number == 0 || self.telegram_client.is_none() {
-            return Ok(());
-        }
-        let telegram_client = self.telegram_client.as_ref().unwrap();
-        let last_epoch = epoch_number - 1;
+    fn fetch_dao_epoch(&self, epoch_number: u64) -> Result<(u64, u64, u64), Error> {
         let mut key_prefix = vec![0u8; 1 + 8];
         key_prefix[0] = KeyPrefix::DaoCell as u8;
-        key_prefix[1..].copy_from_slice(&last_epoch.to_be_bytes());
+        key_prefix[1..].copy_from_slice(&epoch_number.to_be_bytes());
 
         let mut total_deposit = 0;
         let mut total_prepare = 0;
@@ -400,31 +397,84 @@ where
                 }
             }
         }
-        let total = total_deposit + total_prepare + total_withdraw;
+        Ok((total_deposit, total_prepare, total_withdraw))
+    }
 
-        // [Notify Level]:
-        // * ALERT   : more than 1GB changed
-        // * WARNING : more than 500MB changed
-        // * NOTE    : more than 200MB changed
-        // * other   : less than 200MB changed
-        let remark = if total >= CKB_1GB {
-            "[ALERT] "
-        } else if total >= CKB_500MB {
-            "[WARNING] "
-        } else if total >= CKB_200MB {
-            "[NOTE] "
-        } else {
-            ""
-        };
-        let message = format!(
-            "{}[epoch#{}] deposit: {}, prepare: {}, withdraw: {}",
-            remark,
-            last_epoch,
-            bytesize::ByteSize::b(total_deposit / ONE_CKB),
-            bytesize::ByteSize::b(total_prepare / ONE_CKB),
-            bytesize::ByteSize::b(total_withdraw / ONE_CKB),
-        );
-        telegram_client.send_notify(message, false);
+    fn dao_report(&self, epoch_number: u64) -> Result<(), Error> {
+        if epoch_number == 0 || self.telegram_client.is_none() {
+            return Ok(());
+        }
+        let telegram_client = self.telegram_client.as_ref().unwrap();
+        let last_epoch = epoch_number - 1;
+        let (current_deposit, current_prepare, current_withdraw) =
+            self.fetch_dao_epoch(last_epoch)?;
+        let current = current_deposit + current_prepare + current_withdraw;
+        if current >= CKB_20MB {
+            // [Notify Level]:
+            // * ALERT   : more than 500MB changed
+            // * WARNING : more than 200MB changed
+            // * NOTE    : more than 50MB changed
+            // * other   : less than 50MB changed
+            let (remark_start, remark_end) = if current >= CKB_500MB {
+                ("<code>ALERT ", "</code>")
+            } else if current >= CKB_200MB {
+                ("<code>WARNING ", "</code>")
+            } else if current >= CKB_50MB {
+                ("<code>NOTE ", "</code>")
+            } else {
+                ("", "")
+            };
+            let message = format!(
+                "{}[epoch#{}] deposit: {}, prepare: {}, withdraw: {}{}",
+                remark_start,
+                last_epoch,
+                bytesize::ByteSize::b(current_deposit / ONE_CKB),
+                bytesize::ByteSize::b(current_prepare / ONE_CKB),
+                bytesize::ByteSize::b(current_withdraw / ONE_CKB),
+                remark_end,
+            );
+            telegram_client.send_notify(message, false);
+        }
+
+        // one day
+        if epoch_number % 6 == 0 {
+            let mut total_deposit = current_deposit;
+            let mut total_prepare = current_prepare;
+            let mut total_withdraw = current_withdraw;
+            for i in 0..5 {
+                let (deposit, prepare, withdraw) = self.fetch_dao_epoch(epoch_number - 6 + i)?;
+                total_deposit += deposit;
+                total_prepare += prepare;
+                total_withdraw += withdraw;
+            }
+            let total = total_deposit + total_prepare + total_withdraw;
+            // [Notify Level]:
+            // * ALERT   : more than 1GB changed
+            // * WARNING : more than 500MB changed
+            // * NOTE    : more than 200MB changed
+            // * other   : less than 200MB changed
+            let (remark_start, remark_end) = if total >= CKB_1GB {
+                ("<code>ALERT ", "</code>")
+            } else if total >= CKB_500MB {
+                ("<code>WARNING ", "</code>")
+            } else if total >= CKB_200MB {
+                ("<code>NOTE ", "</code>")
+            } else {
+                ("", "")
+            };
+            let message = format!(
+                "{}[<b>EPOCH#{}-#{}</b>] deposit: {}, prepare: {}, withdraw: {}{}",
+                remark_start,
+                epoch_number - 6,
+                epoch_number - 1,
+                bytesize::ByteSize::b(total_deposit / ONE_CKB),
+                bytesize::ByteSize::b(total_prepare / ONE_CKB),
+                bytesize::ByteSize::b(total_withdraw / ONE_CKB),
+                remark_end,
+            );
+            telegram_client.send_notify(message, false);
+        }
+
         Ok(())
     }
 

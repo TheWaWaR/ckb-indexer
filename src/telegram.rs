@@ -36,6 +36,7 @@ impl TelegramClient {
             .query(&[
                 ("chat_id", self.chat_id.as_str()),
                 ("text", messages_all.as_str()),
+                ("parse_mode", "html"),
             ])
             .send()
             .map_err(|err| err.to_string())
