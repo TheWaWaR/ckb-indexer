@@ -5,7 +5,7 @@ use crate::{
 };
 
 use ckb_types::{
-    core::{BlockNumber, BlockView},
+    core::{BlockNumber, BlockView, EpochNumber},
     h256,
     packed::{Byte32, Bytes, CellOutput, OutPoint, Script},
     prelude::*,
@@ -13,7 +13,6 @@ use ckb_types::{
 };
 use thiserror::Error;
 
-use chrono::{Local, TimeZone};
 use std::convert::TryInto;
 use std::{
     collections::HashMap,
@@ -37,6 +36,25 @@ pub const CKB_200MB: u64 = 200 * CKB_1MB;
 pub const CKB_500MB: u64 = 500 * CKB_1MB;
 pub const CKB_1GB: u64 = 10 * CKB_100MB;
 
+#[derive(Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum DaoAction {
+    Deposit = 0,
+    Prepare = 1,
+    Withdraw = 2,
+}
+
+impl DaoAction {
+    fn from_u8(value: u8) -> Option<DaoAction> {
+        match value {
+            0 => Some(DaoAction::Deposit),
+            1 => Some(DaoAction::Prepare),
+            2 => Some(DaoAction::Withdraw),
+            _ => None,
+        }
+    }
+}
+
 /// +--------------+--------------------+--------------------------+
 /// | KeyPrefix::  | Key::              | Value::                  |
 /// +--------------+--------------------+--------------------------+
@@ -48,6 +66,8 @@ pub const CKB_1GB: u64 = 10 * CKB_100MB;
 /// | 160          | TxTypeScript       | TxHash                   |
 /// | 192          | TxHash             | TransactionInputs        | * rollback and prune
 /// | 224          | Header             | Transactions             |
+/// | 230          | DaoCell            | DaoItem                  |
+/// | 231          | DaoEpoch           | DaoEpochNumber           |
 /// +--------------+--------------------+--------------------------+
 
 pub enum Key<'a> {
@@ -59,10 +79,14 @@ pub enum Key<'a> {
     TxTypeScript(&'a Script, BlockNumber, TxIndex, CellIndex, CellType),
     TxHash(&'a Byte32),
     Header(BlockNumber, &'a Byte32),
+    DaoCell(EpochNumber, BlockNumber, TxIndex, CellIndex, CellType),
+    DaoEpoch,
 }
 
 pub enum Value<'a> {
     Cell(BlockNumber, TxIndex, &'a CellOutput, &'a Bytes),
+    DaoItem(DaoAction, u64),
+    DaoEpochNumber(u64),
     TxHash(&'a Byte32),
     TransactionInputs(Vec<OutPoint>),
     Transactions(Vec<(Byte32, u32)>),
@@ -78,6 +102,8 @@ pub enum KeyPrefix {
     TxTypeScript = 160,
     TxHash = 192,
     Header = 224,
+    DaoCell = 230,
+    DaoEpoch = 231,
 }
 
 impl<'a> Key<'a> {
@@ -133,6 +159,20 @@ impl<'a> From<Key<'a>> for Vec<u8> {
                 encoded.extend_from_slice(&block_number.to_be_bytes());
                 encoded.extend_from_slice(block_hash.as_slice());
             }
+            Key::DaoCell(epoch_number, block_number, tx_index, io_index, io_type) => {
+                encoded.push(KeyPrefix::DaoCell as u8);
+                encoded.extend_from_slice(&epoch_number.to_be_bytes());
+                encoded.extend_from_slice(&block_number.to_be_bytes());
+                encoded.extend_from_slice(&tx_index.to_be_bytes());
+                encoded.extend_from_slice(&io_index.to_be_bytes());
+                match io_type {
+                    CellType::Input => encoded.push(0),
+                    CellType::Output => encoded.push(1),
+                }
+            }
+            Key::DaoEpoch => {
+                encoded.push(KeyPrefix::DaoEpoch as u8);
+            }
         }
         encoded
     }
@@ -170,6 +210,13 @@ impl<'a> From<Value<'a>> for Vec<u8> {
                 encoded.extend_from_slice(&tx_index.to_le_bytes());
                 encoded.extend_from_slice(output.as_slice());
                 encoded.extend_from_slice(output_data.as_slice());
+            }
+            Value::DaoItem(action, capacity) => {
+                encoded.push(action as u8);
+                encoded.extend_from_slice(&capacity.to_le_bytes());
+            }
+            Value::DaoEpochNumber(epoch_number) => {
+                encoded.extend_from_slice(&epoch_number.to_le_bytes());
             }
             Value::TxHash(tx_hash) => {
                 encoded.extend_from_slice(tx_hash.as_slice());
@@ -285,53 +332,83 @@ impl<S> Indexer<S>
 where
     S: Store,
 {
-    fn analysis(
+    fn append_dao_item<B: Batch>(
         &self,
+        batch: &mut B,
         type_script: &Script,
         output: &CellOutput,
         output_data: &Bytes,
+        epoch_number: u64,
         block_number: u64,
-        block: &BlockView,
-        is_inputs: bool,
-    ) {
-        if let Some(telegram_client) = self.telegram_client.as_ref() {
-            if type_script.code_hash().as_slice() == DAO_TYPE_HASH.as_bytes() {
-                let capacity: u64 = output.capacity().unpack();
-                let timestamp = block.timestamp();
-                // 1MB CKB
-                if capacity >= CKB_1MB {
-                    let data = output_data.raw_data();
-                    let action = if data.as_ref() == [0u8; 8] {
-                        "deposit"
-                    } else if data.as_ref().len() == 8 {
-                        if is_inputs {
-                            "withdraw"
-                        } else {
-                            "prepare"
-                        }
-                    } else {
-                        unreachable!();
-                    };
-                    let dt = Local.timestamp_millis(timestamp as i64);
-                    let message = format!(
-                        "[#{}@{}] {} {}",
-                        block_number,
-                        dt,
-                        action,
-                        bytesize::ByteSize(capacity / ONE_CKB),
-                        // output.lock()
-                    );
-                    match telegram_client.send_notify(message.clone(), true) {
-                        Ok(info) => {
-                            log::info!("notify telegram: {}, info: {}", message, info);
-                        }
-                        Err(err) => {
-                            log::error!("notify telegram error: {}", err);
-                        }
-                    }
+        tx_index: u32,
+        cell_index: u32,
+        cell_type: CellType,
+    ) -> Result<(), Error> {
+        if type_script.code_hash().as_slice() == DAO_TYPE_HASH.as_bytes() {
+            let capacity: u64 = output.capacity().unpack();
+            let data = output_data.raw_data();
+            let action = if data.as_ref() == [0u8; 8] {
+                DaoAction::Deposit
+            } else if data.as_ref().len() == 8 {
+                if let CellType::Input = cell_type {
+                    DaoAction::Withdraw
+                } else {
+                    DaoAction::Prepare
+                }
+            } else {
+                unreachable!();
+            };
+            batch.put_kv(
+                Key::DaoCell(epoch_number, block_number, tx_index, cell_index, cell_type),
+                Value::DaoItem(action, capacity),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn dao_report(&self, epoch_number: u64) -> Result<(), Error> {
+        if epoch_number == 0 || self.telegram_client.is_none() {
+            return Ok(());
+        }
+        let telegram_client = self.telegram_client.as_ref().unwrap();
+        let last_epoch = epoch_number - 1;
+        let mut key_prefix = vec![0u8; 1 + 8];
+        key_prefix[0] = KeyPrefix::DaoCell as u8;
+        key_prefix[1..].copy_from_slice(&last_epoch.to_be_bytes());
+
+        let mut total_deposit = 0;
+        let mut total_prepare = 0;
+        let mut total_withdraw = 0;
+        for (_key, value) in self
+            .store
+            .iter(&key_prefix, IteratorDirection::Forward)?
+            .take_while(|(key, _value)| key.starts_with(&key_prefix))
+        {
+            let action = DaoAction::from_u8(value[0]).expect("dao action");
+            let mut capacity_bytes = [0u8; 8];
+            capacity_bytes.copy_from_slice(&value[1..]);
+            let capacity = u64::from_le_bytes(capacity_bytes);
+            match action {
+                DaoAction::Deposit => {
+                    total_deposit += capacity;
+                }
+                DaoAction::Prepare => {
+                    total_prepare += capacity;
+                }
+                DaoAction::Withdraw => {
+                    total_withdraw += capacity;
                 }
             }
         }
+        let message = format!(
+            "[epoch#{}] deposit: {}, prepare: {}, withdraw: {}",
+            last_epoch,
+            bytesize::ByteSize::b(total_deposit / ONE_CKB),
+            bytesize::ByteSize::b(total_prepare / ONE_CKB),
+            bytesize::ByteSize::b(total_withdraw / ONE_CKB),
+        );
+        telegram_client.send_notify(message, false);
+        Ok(())
     }
 
     pub fn append(&self, block: &BlockView) -> Result<(), Error> {
@@ -349,6 +426,8 @@ where
         )?;
 
         let block_number = block.number();
+        let epoch = block.epoch();
+        let epoch_number = epoch.number();
         let transactions = block.transactions();
         let pool = self.pool.as_ref().map(|p| p.write().expect("acquire lock"));
         for (tx_index, tx) in transactions.iter().enumerate() {
@@ -410,7 +489,17 @@ where
                         Value::TxHash(&tx_hash),
                     )?;
                     if let Some(script) = output.type_().to_opt() {
-                        self.analysis(&script, &output, &output_data, block_number, block, true);
+                        self.append_dao_item(
+                            &mut batch,
+                            &script,
+                            &output,
+                            &output_data,
+                            epoch_number,
+                            block_number,
+                            tx_index,
+                            input_index,
+                            CellType::Input,
+                        )?;
                         batch.delete(
                             Key::CellTypeScript(
                                 &script,
@@ -463,7 +552,17 @@ where
                     Value::TxHash(&tx_hash),
                 )?;
                 if let Some(script) = output.type_().to_opt() {
-                    self.analysis(&script, &output, &output_data, block_number, block, false);
+                    self.append_dao_item(
+                        &mut batch,
+                        &script,
+                        &output,
+                        &output_data,
+                        epoch_number,
+                        block_number,
+                        tx_index,
+                        output_index,
+                        CellType::Output,
+                    )?;
                     batch.put_kv(
                         Key::CellTypeScript(&script, block_number, tx_index, output_index),
                         Value::TxHash(&tx_hash),
@@ -506,9 +605,9 @@ where
         if block_number % self.prune_interval == 0 {
             self.prune()?;
         }
-        if block_number % 1000 == 0 {
-            self.flush_telegram();
-        }
+        if epoch.index() == 23 {
+            self.dao_report(epoch.number())?;
+        };
         Ok(())
     }
 
