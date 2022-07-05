@@ -680,6 +680,7 @@ where
 
     pub fn rollback(&self) -> Result<(), Error> {
         if let Some((block_number, block_hash)) = self.tip()? {
+            // FIXME: reverse iter from epoch::max() when block number matched delete it.
             let mut batch = self.store.batch()?;
             let txs = Value::parse_transactions_value(
                 &self
