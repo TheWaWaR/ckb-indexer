@@ -680,8 +680,35 @@ where
 
     pub fn rollback(&self) -> Result<(), Error> {
         if let Some((block_number, block_hash)) = self.tip()? {
-            // FIXME: reverse iter from epoch::max() when block number matched delete it.
             let mut batch = self.store.batch()?;
+            {
+                // rollback dao items
+                let mut key_prefix = vec![0u8; 1 + 8];
+                key_prefix[0] = KeyPrefix::DaoCell as u8;
+                key_prefix[1..].copy_from_slice(&u64::max_value().to_be_bytes());
+                let mut u64_bytes = [0u8; 8];
+                let mut u32_bytes = [0u8; 4];
+                for (key, _value) in self
+                    .store
+                    .iter(&key_prefix, IteratorDirection::Reverse)?
+                    .take_while(|(key, _value)| key[0] == KeyPrefix::DaoCell as u8)
+                {
+                    u64_bytes.copy_from_slice(&key[9..9 + 8]);
+                    u32_bytes.copy_from_slice(&key[9 + 8..9 + 8 + 4]);
+                    let dao_item_block_number = u64::from_be_bytes(u64_bytes);
+                    let dao_item_tx_index = u32::from_be_bytes(u32_bytes);
+                    if dao_item_block_number != block_number {
+                        break;
+                    } else {
+                        log::info!(
+                            "rollback dao item: block#{} - tx#{}",
+                            dao_item_block_number,
+                            dao_item_tx_index
+                        );
+                        batch.delete(key)?;
+                    }
+                }
+            }
             let txs = Value::parse_transactions_value(
                 &self
                     .store
