@@ -38,7 +38,7 @@ pub const CKB_200MB: u64 = 200 * CKB_1MB;
 pub const CKB_500MB: u64 = 500 * CKB_1MB;
 pub const CKB_1GB: u64 = 10 * CKB_100MB;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 #[repr(u8)]
 pub enum DaoAction {
     Deposit = 0,
@@ -368,7 +368,10 @@ where
         Ok(())
     }
 
-    fn fetch_dao_epoch(&self, epoch_number: u64) -> Result<(u64, u64, u64), Error> {
+    fn fetch_dao_epoch(
+        &self,
+        epoch_number: u64,
+    ) -> Result<(Vec<(u64, u32, DaoAction, u64)>, u64, u64, u64), Error> {
         let mut key_prefix = vec![0u8; 1 + 8];
         key_prefix[0] = KeyPrefix::DaoCell as u8;
         key_prefix[1..].copy_from_slice(&epoch_number.to_be_bytes());
@@ -376,15 +379,22 @@ where
         let mut total_deposit = 0;
         let mut total_prepare = 0;
         let mut total_withdraw = 0;
-        for (_key, value) in self
+        let mut items = Vec::new();
+        let mut u64_bytes = [0u8; 8];
+        let mut u32_bytes = [0u8; 4];
+        for (key, value) in self
             .store
             .iter(&key_prefix, IteratorDirection::Forward)?
             .take_while(|(key, _value)| key.starts_with(&key_prefix))
         {
+            u64_bytes.copy_from_slice(&key[9..17]);
+            let block_number = u64::from_be_bytes(u64_bytes);
+            u32_bytes.copy_from_slice(&key[17..21]);
+            let tx_index = u32::from_be_bytes(u32_bytes);
+
             let action = DaoAction::from_u8(value[0]).expect("dao action");
-            let mut capacity_bytes = [0u8; 8];
-            capacity_bytes.copy_from_slice(&value[1..]);
-            let capacity = u64::from_le_bytes(capacity_bytes);
+            u64_bytes.copy_from_slice(&value[1..]);
+            let capacity = u64::from_le_bytes(u64_bytes);
             match action {
                 DaoAction::Deposit => {
                     total_deposit += capacity;
@@ -396,8 +406,9 @@ where
                     total_withdraw += capacity;
                 }
             }
+            items.push((block_number, tx_index, action, capacity));
         }
-        Ok((total_deposit, total_prepare, total_withdraw))
+        Ok((items, total_deposit, total_prepare, total_withdraw))
     }
 
     fn dao_report(&self, epoch_number: u64) -> Result<(), Error> {
@@ -406,7 +417,7 @@ where
         }
         let telegram_client = self.telegram_client.as_ref().unwrap();
         let last_epoch = epoch_number - 1;
-        let (current_deposit, current_prepare, current_withdraw) =
+        let (current_items, current_deposit, current_prepare, current_withdraw) =
             self.fetch_dao_epoch(last_epoch)?;
         let current = current_deposit + current_prepare + current_withdraw;
         if current >= CKB_20MB {
@@ -441,12 +452,51 @@ where
             let mut total_deposit = current_deposit;
             let mut total_prepare = current_prepare;
             let mut total_withdraw = current_withdraw;
+            let mut total_items = Vec::new();
             for i in 0..5 {
-                let (deposit, prepare, withdraw) = self.fetch_dao_epoch(epoch_number - 6 + i)?;
+                let (items, deposit, prepare, withdraw) =
+                    self.fetch_dao_epoch(epoch_number - 6 + i)?;
+                total_items.extend(items);
                 total_deposit += deposit;
                 total_prepare += prepare;
                 total_withdraw += withdraw;
             }
+            total_items.extend(current_items);
+            total_items.sort_by_key(|(_, _, action, _)| *action);
+            let mut items_message_len = 0;
+            let mut items_messages = Vec::new();
+            let mut current_action = u8::max_value();
+            for (block_number, tx_index, action, capacity) in total_items {
+                if action as u8 != current_action {
+                    let action_message = format!("[ {:?} ]", action);
+                    items_message_len += action_message.len() + 1;
+                    items_messages.push(action_message);
+                    current_action = action as u8;
+                }
+                let message = format!(
+                    "{}#{} {}",
+                    block_number,
+                    tx_index,
+                    bytesize::ByteSize::b(capacity / ONE_CKB)
+                );
+                items_message_len += message.len() + 1;
+                items_messages.push(message);
+                // https://github.com/yagop/node-telegram-bot-api/issues/165
+                // current message limit is 4096 bytes
+                if items_message_len >= 4000 {
+                    telegram_client
+                        .send_notify(format!("<pre>{}</pre>", items_messages.join("\n")), false);
+                    items_messages = Vec::new();
+                    items_message_len = 0;
+                }
+            }
+            if !items_messages.is_empty() {
+                telegram_client.send_notify(
+                    format!("<pre>{}</pre>", items_messages.join("\n")),
+                    items_message_len < 3600,
+                );
+            }
+            telegram_client.send_notify("<code>----------------</code>".to_string(), true);
             let total = total_deposit + total_prepare + total_withdraw;
             // [Notify Level]:
             // * ALERT   : more than 1GB changed
@@ -474,7 +524,6 @@ where
             );
             telegram_client.send_notify(message, false);
         }
-
         Ok(())
     }
 
