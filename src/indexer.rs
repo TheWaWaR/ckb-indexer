@@ -4,6 +4,7 @@ use crate::{
     store::{Batch, Error as StoreError, IteratorDirection, Store},
 };
 
+use chrono::{Local, TimeZone};
 use ckb_types::{
     core::{BlockNumber, BlockView, EpochNumber},
     h256,
@@ -29,6 +30,7 @@ pub enum CellType {
 pub const DAO_TYPE_HASH: H256 =
     h256!("0x82d76d1b75fe2fd9a27dfbaa65a039221a380d76c926f378d3f81cf3e7e13f2e");
 pub const ONE_CKB: u64 = 100_000_000;
+pub const CKB_50KB: u64 = 50_000 * ONE_CKB;
 pub const CKB_1MB: u64 = 1_000_000 * ONE_CKB;
 pub const CKB_10MB: u64 = 10 * CKB_1MB;
 pub const CKB_20MB: u64 = 20 * CKB_1MB;
@@ -87,8 +89,10 @@ pub enum Key<'a> {
 
 pub enum Value<'a> {
     Cell(BlockNumber, TxIndex, &'a CellOutput, &'a Bytes),
+    // (DaoAction, capacity)
     DaoItem(DaoAction, u64),
-    DaoEpochNumber(u64),
+    // (EpochNumber, timestamp)
+    DaoEpochInfo(EpochNumber, u64),
     TxHash(&'a Byte32),
     TransactionInputs(Vec<OutPoint>),
     Transactions(Vec<(Byte32, u32)>),
@@ -217,8 +221,9 @@ impl<'a> From<Value<'a>> for Vec<u8> {
                 encoded.push(action as u8);
                 encoded.extend_from_slice(&capacity.to_le_bytes());
             }
-            Value::DaoEpochNumber(epoch_number) => {
+            Value::DaoEpochInfo(epoch_number, timestamp) => {
                 encoded.extend_from_slice(&epoch_number.to_le_bytes());
+                encoded.extend_from_slice(&timestamp.to_le_bytes());
             }
             Value::TxHash(tx_hash) => {
                 encoded.extend_from_slice(tx_hash.as_slice());
@@ -463,12 +468,49 @@ where
             }
             total_items.extend(current_items);
             total_items.sort_by_key(|(_, _, action, _)| *action);
+            let (mut deposit_count, mut deposit_omitted) = (0, 0);
+            let (mut prepare_count, mut prepare_omitted) = (0, 0);
+            let (mut withdraw_count, mut withdraw_omitted) = (0, 0);
+            for (_, _, action, capacity) in &total_items {
+                let omitted = *capacity < CKB_50KB;
+                match action {
+                    DaoAction::Deposit => {
+                        deposit_count += 1;
+                        if omitted {
+                            deposit_omitted += 1;
+                        }
+                    }
+                    DaoAction::Prepare => {
+                        prepare_count += 1;
+                        if omitted {
+                            prepare_omitted += 1;
+                        }
+                    }
+                    DaoAction::Withdraw => {
+                        withdraw_count += 1;
+                        if omitted {
+                            withdraw_omitted += 1;
+                        }
+                    }
+                }
+            }
+
             let mut items_message_len = 0;
             let mut items_messages = Vec::new();
             let mut current_action = u8::max_value();
             for (block_number, tx_index, action, capacity) in total_items {
+                // filter out small capacity
+                if capacity < CKB_50KB {
+                    continue;
+                }
                 if action as u8 != current_action {
-                    let action_message = format!("[ {:?} ]", action);
+                    let (count, omitted) = match action {
+                        DaoAction::Deposit => (deposit_count, deposit_omitted),
+                        DaoAction::Prepare => (prepare_count, prepare_omitted),
+                        DaoAction::Withdraw => (withdraw_count, withdraw_omitted),
+                    };
+                    let action_message =
+                        format!("[ {:?} ({}/{}) ]", action, count - omitted, count);
                     items_message_len += action_message.len() + 1;
                     items_messages.push(action_message);
                     current_action = action as u8;
@@ -496,31 +538,50 @@ where
                     items_message_len < 3600,
                 );
             }
-            telegram_client.send_notify("<code>----------------</code>".to_string(), true);
+            let date = self
+                .store
+                .get([KeyPrefix::DaoEpoch as u8])?
+                .map(|value| {
+                    let mut u64_bytes = [0u8; 8];
+                    u64_bytes.copy_from_slice(&value[8..16]);
+                    let timestamp = u64::from_le_bytes(u64_bytes);
+                    Local
+                        .timestamp_millis(timestamp as i64)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            telegram_client.send_notify(
+                format!(
+                    "<pre>({}, {} omitted because capacity less than 50KB)</pre>",
+                    date,
+                    deposit_omitted + prepare_omitted + withdraw_omitted
+                ),
+                true,
+            );
             let total = total_deposit + total_prepare + total_withdraw;
             // [Notify Level]:
             // * ALERT   : more than 1GB changed
             // * WARNING : more than 500MB changed
             // * NOTE    : more than 200MB changed
             // * other   : less than 200MB changed
-            let (remark_start, remark_end) = if total >= CKB_1GB {
-                ("<code>ALERT ", "</code>")
+            let mark = if total >= CKB_1GB {
+                "<code>ALERT</code> "
             } else if total >= CKB_500MB {
-                ("<code>WARNING ", "</code>")
+                "<code>WARNING</code> "
             } else if total >= CKB_200MB {
-                ("<code>NOTE ", "</code>")
+                "<code>NOTE</code> "
             } else {
-                ("", "")
+                ""
             };
             let message = format!(
-                "{}[<b>EPOCH#{}-#{}</b>] deposit: {}, prepare: {}, withdraw: {}{}",
-                remark_start,
+                "{}[EPOCH<b>#{}-#{}</b>] deposit: <b>{}</b>, prepare: <b>{}</b>, withdraw: <b>{}</b>",
+                mark,
                 epoch_number - 6,
                 epoch_number - 1,
                 bytesize::ByteSize::b(total_deposit / ONE_CKB),
                 bytesize::ByteSize::b(total_prepare / ONE_CKB),
                 bytesize::ByteSize::b(total_withdraw / ONE_CKB),
-                remark_end,
             );
             telegram_client.send_notify(message, false);
         }
@@ -709,6 +770,12 @@ where
                         .map(|input| input.previous_output())
                         .collect(),
                 ),
+            )?;
+        }
+        if epoch.index() == epoch.length() - 1 {
+            batch.put_kv(
+                Key::DaoEpoch,
+                Value::DaoEpochInfo(epoch_number, block.timestamp()),
             )?;
         }
 
