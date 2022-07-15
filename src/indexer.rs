@@ -4,6 +4,7 @@ use crate::{
     store::{Batch, Error as StoreError, IteratorDirection, Store},
 };
 
+use bytesize::ByteSize;
 use chrono::{Local, TimeZone};
 use ckb_types::{
     core::{BlockNumber, BlockView, EpochNumber},
@@ -365,6 +366,9 @@ where
             } else {
                 unreachable!();
             };
+            if capacity >= CKB_10MB {
+                log::info!("DAO {:?} {}", action, ByteSize::b(capacity / ONE_CKB));
+            }
             batch.put_kv(
                 Key::DaoCell(epoch_number, block_number, tx_index, cell_index, cell_type),
                 Value::DaoItem(action, capacity),
@@ -444,9 +448,9 @@ where
                 "{}[epoch#{}] deposit: {}, prepare: {}, withdraw: {}{}",
                 remark_start,
                 last_epoch,
-                bytesize::ByteSize::b(current_deposit / ONE_CKB),
-                bytesize::ByteSize::b(current_prepare / ONE_CKB),
-                bytesize::ByteSize::b(current_withdraw / ONE_CKB),
+                ByteSize::b(current_deposit / ONE_CKB),
+                ByteSize::b(current_prepare / ONE_CKB),
+                ByteSize::b(current_withdraw / ONE_CKB),
                 remark_end,
             );
             telegram_client.send_notify(message, false);
@@ -519,7 +523,7 @@ where
                     "{}#{} {}",
                     block_number,
                     tx_index,
-                    bytesize::ByteSize::b(capacity / ONE_CKB)
+                    ByteSize::b(capacity / ONE_CKB)
                 );
                 items_message_len += message.len() + 1;
                 items_messages.push(message);
@@ -579,9 +583,9 @@ where
                 mark,
                 epoch_number - 6,
                 epoch_number - 1,
-                bytesize::ByteSize::b(total_deposit / ONE_CKB),
-                bytesize::ByteSize::b(total_prepare / ONE_CKB),
-                bytesize::ByteSize::b(total_withdraw / ONE_CKB),
+                ByteSize::b(total_deposit / ONE_CKB),
+                ByteSize::b(total_prepare / ONE_CKB),
+                ByteSize::b(total_withdraw / ONE_CKB),
             );
             telegram_client.send_notify(message, false);
         }
