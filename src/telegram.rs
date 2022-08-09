@@ -31,6 +31,7 @@ impl TelegramClient {
         }
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
         let client = Client::new();
+        log::info!("[the message]:\n{}", messages_all);
         client
             .post(url)
             .query(&[
