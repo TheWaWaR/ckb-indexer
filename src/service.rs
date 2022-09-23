@@ -21,6 +21,7 @@ use version_compare::Version;
 
 use std::convert::TryInto;
 use std::net::ToSocketAddrs;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ pub struct Service {
     version: String,
     telegram_token: Option<String>,
     telegram_chat_id: Option<String>,
+    analysis_log: Option<PathBuf>,
 }
 
 impl Service {
@@ -46,6 +48,7 @@ impl Service {
         version: String,
         telegram_token: Option<String>,
         telegram_chat_id: Option<String>,
+        analysis_log: Option<PathBuf>,
     ) -> Self {
         let store = RocksdbStore::new(store_path);
         Self {
@@ -56,6 +59,7 @@ impl Service {
             version,
             telegram_token,
             telegram_chat_id,
+            analysis_log,
         }
     }
 
@@ -106,6 +110,7 @@ impl Service {
             1000,
             self.pool.clone(),
             telegram_client,
+            self.analysis_log.clone(),
         );
 
         loop {
@@ -923,7 +928,7 @@ mod tests {
     fn rpc() {
         let store = new_store("rpc");
         let pool = Arc::new(RwLock::new(Pool::default()));
-        let indexer = Indexer::new(store.clone(), 10, 100, None);
+        let indexer = Indexer::new(store.clone(), 10, 100, None, None, None);
         let rpc = IndexerRpcImpl {
             store,
             pool: Some(pool.clone()),

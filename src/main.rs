@@ -13,6 +13,7 @@ use jsonrpc_server_utils::{
     tokio_util::codec::Decoder,
 };
 use log::{debug, error};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 #[tokio::main]
@@ -61,6 +62,14 @@ async fn main() {
                 .required(false)
                 .takes_value(true)
         )
+        .arg(
+            Arg::with_name("analysis_log")
+                .short("a")
+                .long("analysis-log")
+                .help("The local analysis log (for backup or network issue)")
+                .required(false)
+                .takes_value(true)
+        )
         .get_matches();
 
     let index_tx_pool = matches.is_present("index_tx_pool");
@@ -77,6 +86,9 @@ async fn main() {
         crate_version!().to_string(),
         matches.value_of("telegram_token").map(|s| s.to_owned()),
         matches.value_of("telegram_chat_id").map(|s| s.to_owned()),
+        matches
+            .value_of("analysis_log")
+            .map(|s| PathBuf::from(s.to_owned())),
     );
 
     let rpc_server = service.start();

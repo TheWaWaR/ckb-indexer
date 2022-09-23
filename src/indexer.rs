@@ -16,6 +16,9 @@ use ckb_types::{
 use thiserror::Error;
 
 use std::convert::TryInto;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -24,6 +27,7 @@ use std::{
 pub type TxIndex = u32;
 pub type OutputIndex = u32;
 pub type CellIndex = u32;
+#[derive(Eq, PartialEq)]
 pub enum CellType {
     Input,
     Output,
@@ -292,6 +296,7 @@ pub struct Indexer<S> {
     // currently only supports removals of dead cells from the pending txs
     pool: Option<Arc<RwLock<Pool>>>,
     telegram_client: Option<TelegramClient>,
+    analysis_log: Option<PathBuf>,
 }
 
 impl<S> Indexer<S> {
@@ -301,6 +306,7 @@ impl<S> Indexer<S> {
         prune_interval: u64,
         pool: Option<Arc<RwLock<Pool>>>,
         telegram_client: Option<TelegramClient>,
+        analysis_log: Option<PathBuf>,
     ) -> Self {
         Self {
             store,
@@ -308,6 +314,7 @@ impl<S> Indexer<S> {
             prune_interval,
             pool,
             telegram_client,
+            analysis_log,
         }
     }
 
@@ -340,6 +347,22 @@ impl<S> Indexer<S>
 where
     S: Store,
 {
+    fn send_notify(&self, message: String, buffered: bool) {
+        if let Some(path) = self.analysis_log.as_ref() {
+            if let Err(err) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| f.write(format!("{}\n\n", message.clone()).as_bytes()))
+            {
+                log::error!("save analysis log error: {}", err);
+            }
+        }
+        if let Some(telegram_client) = self.telegram_client.as_ref() {
+            telegram_client.send_notify(message, buffered);
+        }
+    }
+
     fn append_dao_item<B: Batch>(
         &self,
         batch: &mut B,
@@ -356,9 +379,14 @@ where
             let capacity: u64 = output.capacity().unpack();
             let data = output_data.raw_data();
             let action = if data.as_ref() == [0u8; 8] {
-                DaoAction::Deposit
+                if CellType::Output == cell_type {
+                    DaoAction::Deposit
+                } else {
+                    // prepare
+                    return Ok(());
+                }
             } else if data.as_ref().len() == 8 {
-                if let CellType::Input = cell_type {
+                if CellType::Input == cell_type {
                     DaoAction::Withdraw
                 } else {
                     DaoAction::Prepare
@@ -421,10 +449,9 @@ where
     }
 
     fn dao_report(&self, epoch_number: u64) -> Result<(), Error> {
-        if epoch_number == 0 || self.telegram_client.is_none() {
+        if epoch_number == 0 {
             return Ok(());
         }
-        let telegram_client = self.telegram_client.as_ref().unwrap();
         let last_epoch = epoch_number - 1;
         let (current_items, current_deposit, current_prepare, current_withdraw) =
             self.fetch_dao_epoch(last_epoch)?;
@@ -453,7 +480,7 @@ where
                 ByteSize::b(current_withdraw / ONE_CKB),
                 remark_end,
             );
-            telegram_client.send_notify(message, false);
+            self.send_notify(message, false);
         }
 
         // one day
@@ -530,14 +557,13 @@ where
                 // https://github.com/yagop/node-telegram-bot-api/issues/165
                 // current message limit is 4096 bytes
                 if items_message_len >= 4000 {
-                    telegram_client
-                        .send_notify(format!("<pre>{}</pre>", items_messages.join("\n")), false);
+                    self.send_notify(format!("<pre>{}</pre>", items_messages.join("\n")), false);
                     items_messages = Vec::new();
                     items_message_len = 0;
                 }
             }
             if !items_messages.is_empty() {
-                telegram_client.send_notify(
+                self.send_notify(
                     format!("<pre>{}</pre>", items_messages.join("\n")),
                     items_message_len < 3600,
                 );
@@ -555,7 +581,7 @@ where
                         .to_string()
                 })
                 .unwrap_or_else(|| "unknown".to_string());
-            telegram_client.send_notify(
+            self.send_notify(
                 format!(
                     "<pre>({}, {} omitted because capacity less than 50KB)</pre>",
                     date,
@@ -587,7 +613,7 @@ where
                 ByteSize::b(total_prepare / ONE_CKB),
                 ByteSize::b(total_withdraw / ONE_CKB),
             );
-            telegram_client.send_notify(message, false);
+            self.send_notify(message, false);
         }
         Ok(())
     }
@@ -1197,7 +1223,7 @@ mod tests {
     fn new_indexer<S: Store>(prefix: &str) -> Indexer<S> {
         let tmp_dir = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
         let store = S::new(tmp_dir.path().to_str().unwrap());
-        Indexer::new(store, 10, 1, None)
+        Indexer::new(store, 10, 1, None, None, None)
     }
 
     #[test]
